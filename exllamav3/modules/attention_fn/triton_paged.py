@@ -886,6 +886,7 @@ def _paged_attn_decode_split_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    FLAT: tl.constexpr = False,   # rows are (query, head) pairs packed densely; one h_block
 ):
     """Flash-decoding phase 1: one program per (batch, kv_head, h_block, kv split). GQA sibling
     q heads and query positions share the row axis so K/V tiles are read once per group."""
@@ -893,17 +894,22 @@ def _paged_attn_decode_split_kernel(
     split = tl.program_id(1)
 
     group_size = n_q_heads // n_kv_heads
-    h_blocks = tl.cdiv(group_size, BLOCK_H)
+    h_blocks = 1 if FLAT else tl.cdiv(group_size, BLOCK_H)
     h_block = pid % h_blocks
     bh = pid // h_blocks
     batch = bh // n_kv_heads
     kv_head = bh - batch * n_kv_heads
 
     rows = tl.arange(0, BLOCK_ROWS)
-    row_q = rows % BLOCK_M
-    row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
+    if FLAT:
+        row_q = rows // group_size
+        row_h_local = rows % group_size
+        valid_row = rows < q_len * group_size
+    else:
+        row_q = rows % BLOCK_M
+        row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
+        valid_row = (row_q < q_len) & (row_h_local < group_size)
     q_head = kv_head * group_size + row_h_local
-    valid_row = (row_q < q_len) & (row_h_local < group_size)
 
     offs_d = tl.arange(0, HD_PAD)
     d_mask = offs_d < head_dim
@@ -1007,6 +1013,243 @@ def _paged_attn_decode_split_kernel(
             tl.store(partial_ml + ml_base + rows * 2 + 1, l)
 
 
+
+@triton.jit
+def _qc_load_kt_ch(qwords, scales, tok_rows, kv_head, g0, mask_n,
+                   BITS: tl.constexpr, n_kv_heads: tl.constexpr, head_dim: tl.constexpr, CH: tl.constexpr):
+    """(CH, BLOCK_N) slice of _qc_load_kt covering head dims [32 * g0, 32 * g0 + CH)."""
+    GPT: tl.constexpr = n_kv_heads * head_dim // 32
+    G: tl.constexpr = head_dim // 32
+    GC: tl.constexpr = CH // 32
+    row_words = tok_rows * (GPT * BITS)
+    qh = qwords + kv_head * (G * BITS) + g0 * BITS
+    raw = tl.zeros((1, 1), tl.int32)
+    pbase = 0
+    first = True
+    if BITS & 8:
+        raw = _qc_plane_kt(qh, row_words, mask_n, pbase, 8, BITS, CH, CH)
+        pbase += 8
+        first = False
+    if BITS & 4:
+        p = _qc_plane_kt(qh, row_words, mask_n, pbase, 4, BITS, CH, CH)
+        raw = p if first else (raw << 4) | p
+        pbase += 4
+        first = False
+    if BITS & 2:
+        p = _qc_plane_kt(qh, row_words, mask_n, pbase, 2, BITS, CH, CH)
+        raw = p if first else (raw << 2) | p
+        pbase += 2
+        first = False
+    if BITS & 1:
+        p = _qc_plane_kt(qh, row_words, mask_n, pbase, 1, BITS, CH, CH)
+        raw = p if first else (raw << 1) | p
+    garr = tl.arange(0, GC)
+    sc = tl.load(scales + tok_rows[None, :] * GPT + (kv_head * G + g0 + garr)[:, None], mask = mask_n[None, :], other = 0.0)
+    scx = tl.reshape(tl.broadcast_to(sc[:, None, :], (GC, 32, sc.shape[1])), (CH, sc.shape[1]))
+    mh = (1 << (BITS - 1)) - 0.5
+    inv_m = 1.0 / (1 << (BITS - 1))
+    return ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
+
+
+@triton.jit
+def _qc_load_v_ch(qwords, scales, tok_rows, kv_head, g0, mask_n,
+                  BITS: tl.constexpr, n_kv_heads: tl.constexpr, head_dim: tl.constexpr, CH: tl.constexpr):
+    """(BLOCK_N, CH) slice of _qc_load_v covering head dims [32 * g0, 32 * g0 + CH)."""
+    GPT: tl.constexpr = n_kv_heads * head_dim // 32
+    G: tl.constexpr = head_dim // 32
+    GC: tl.constexpr = CH // 32
+    row_words = tok_rows * (GPT * BITS)
+    qh = qwords + kv_head * (G * BITS) + g0 * BITS
+    raw = tl.zeros((1, 1), tl.int32)
+    pbase = 0
+    first = True
+    if BITS & 8:
+        raw = _qc_plane_v(qh, row_words, mask_n, pbase, 8, BITS, CH, CH)
+        pbase += 8
+        first = False
+    if BITS & 4:
+        p = _qc_plane_v(qh, row_words, mask_n, pbase, 4, BITS, CH, CH)
+        raw = p if first else (raw << 4) | p
+        pbase += 4
+        first = False
+    if BITS & 2:
+        p = _qc_plane_v(qh, row_words, mask_n, pbase, 2, BITS, CH, CH)
+        raw = p if first else (raw << 2) | p
+        pbase += 2
+        first = False
+    if BITS & 1:
+        p = _qc_plane_v(qh, row_words, mask_n, pbase, 1, BITS, CH, CH)
+        raw = p if first else (raw << 1) | p
+    garr = tl.arange(0, GC)
+    sc = tl.load(scales + tok_rows[:, None] * GPT + (kv_head * G + g0 + garr)[None, :], mask = mask_n[:, None], other = 0.0)
+    scx = tl.reshape(tl.broadcast_to(sc[:, :, None], (sc.shape[0], GC, 32)), (sc.shape[0], CH))
+    mh = (1 << (BITS - 1)) - 0.5
+    inv_m = 1.0 / (1 << (BITS - 1))
+    return ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
+
+
+@triton.jit
+def _paged_attn_decode_split_qc256_kernel(
+    q,
+    k_cache,
+    v_cache,
+    block_table,
+    cache_seqlens,
+    out,
+    partial_o,
+    partial_ml,
+    k_scales,
+    v_scales,
+    h32,
+    split_len,
+    num_pages_per_seq,
+    num_splits,
+    sinks,
+    QCK: tl.constexpr,
+    QCV: tl.constexpr,
+    q_len: tl.constexpr,
+    kv_append_len: tl.constexpr,
+    n_q_heads: tl.constexpr,
+    n_kv_heads: tl.constexpr,
+    page_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    HD_PAD: tl.constexpr,
+    scale: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
+    SOFTCAP: tl.constexpr,
+    FINAL: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    FLAT: tl.constexpr = False,
+):
+    """_paged_attn_decode_split_kernel for a quantized cache at head_dim 256, with the head dim
+    walked in four 64-wide chunks. Same arguments and partial layout, so the combine kernel and
+    the graph path's C++ launch are shared. The full-width version keeps a 256-wide accumulator,
+    query and two unpacked tiles live at once (243 registers/thread, 2 blocks per SM); chunking
+    keeps one quarter of each tile live."""
+    CH: tl.constexpr = 64
+    pid = tl.program_id(0)
+    split = tl.program_id(1)
+
+    group_size = n_q_heads // n_kv_heads
+    h_blocks = 1 if FLAT else tl.cdiv(group_size, BLOCK_H)
+    h_block = pid % h_blocks
+    bh = pid // h_blocks
+    batch = bh // n_kv_heads
+    kv_head = bh - batch * n_kv_heads
+
+    rows = tl.arange(0, BLOCK_ROWS)
+    if FLAT:
+        row_q = rows // group_size
+        row_h_local = rows % group_size
+        valid_row = rows < q_len * group_size
+    else:
+        row_q = rows % BLOCK_M
+        row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
+        valid_row = (row_q < q_len) & (row_h_local < group_size)
+    q_head = kv_head * group_size + row_h_local
+
+    offs_c = tl.arange(0, CH)
+    q_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
+    q_ptr = q + q_base[:, None] + offs_c[None, :]
+    q0 = _rot_h32(tl.load(q_ptr, mask=valid_row[:, None], other=0.0), h32, BLOCK_ROWS, CH)
+    q1 = _rot_h32(tl.load(q_ptr + CH, mask=valid_row[:, None], other=0.0), h32, BLOCK_ROWS, CH)
+    q2 = _rot_h32(tl.load(q_ptr + 2 * CH, mask=valid_row[:, None], other=0.0), h32, BLOCK_ROWS, CH)
+    q3 = _rot_h32(tl.load(q_ptr + 3 * CH, mask=valid_row[:, None], other=0.0), h32, BLOCK_ROWS, CH)
+
+    total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
+    q_abs = total_k_len - q_len + row_q
+
+    if WINDOW_LEFT >= 0:
+        w_lo = tl.maximum(total_k_len - q_len - WINDOW_LEFT, 0)
+        w_lo = (w_lo // BLOCK_N) * BLOCK_N
+        w_span = tl.cdiv(tl.cdiv(total_k_len - w_lo, num_splits), BLOCK_N) * BLOCK_N
+        n_start = w_lo + split * w_span
+        n_end = tl.minimum(n_start + w_span, total_k_len)
+    else:
+        n_start = split * split_len
+        n_end = tl.minimum(n_start + split_len, total_k_len)
+
+    m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
+    l = tl.full((BLOCK_ROWS,), 0.0, tl.float32)
+    acc0 = tl.zeros((BLOCK_ROWS, CH), tl.float32)
+    acc1 = tl.zeros((BLOCK_ROWS, CH), tl.float32)
+    acc2 = tl.zeros((BLOCK_ROWS, CH), tl.float32)
+    acc3 = tl.zeros((BLOCK_ROWS, CH), tl.float32)
+
+    for n0 in range(n_start, n_end, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < n_end
+        page = offs_n // page_size
+        page_off = offs_n - page * page_size
+        phys = tl.load(block_table + batch * num_pages_per_seq + page, mask=mask_n, other=0)
+        tok_rows = phys * page_size + page_off
+
+        scores = tl.dot(q0, _qc_load_kt_ch(k_cache, k_scales, tok_rows, kv_head, 0, mask_n, QCK, n_kv_heads, head_dim, CH))
+        scores += tl.dot(q1, _qc_load_kt_ch(k_cache, k_scales, tok_rows, kv_head, 2, mask_n, QCK, n_kv_heads, head_dim, CH))
+        scores += tl.dot(q2, _qc_load_kt_ch(k_cache, k_scales, tok_rows, kv_head, 4, mask_n, QCK, n_kv_heads, head_dim, CH))
+        scores += tl.dot(q3, _qc_load_kt_ch(k_cache, k_scales, tok_rows, kv_head, 6, mask_n, QCK, n_kv_heads, head_dim, CH))
+        scores = scores * scale
+        if SOFTCAP > 0.0:
+            scores_scaled = scores / SOFTCAP
+            scores = (2.0 / (1.0 + tl.exp(-2.0 * scores_scaled)) - 1.0) * SOFTCAP
+
+        valid = valid_row[:, None] & mask_n[None, :]
+        if CAUSAL:
+            valid = valid & (offs_n[None, :] <= q_abs[:, None])
+        if WINDOW_LEFT >= 0:
+            valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
+        if WINDOW_RIGHT >= 0:
+            valid = valid & (offs_n[None, :] <= q_abs[:, None] + WINDOW_RIGHT)
+        scores = tl.where(valid, scores, -float("inf"))
+
+        m_new = tl.maximum(m, tl.max(scores, axis=1))
+        m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
+        p = tl.exp(scores - m_exp[:, None])
+        p = tl.where(valid, p, 0.0)
+        alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+        l = l * alpha + tl.sum(p, axis=1)
+        m = m_new
+        p16 = p.to(tl.float16)
+
+        acc0 = acc0 * alpha[:, None] + tl.dot(p16, _qc_load_v_ch(v_cache, v_scales, tok_rows, kv_head, 0, mask_n, QCV, n_kv_heads, head_dim, CH))
+        acc1 = acc1 * alpha[:, None] + tl.dot(p16, _qc_load_v_ch(v_cache, v_scales, tok_rows, kv_head, 2, mask_n, QCV, n_kv_heads, head_dim, CH))
+        acc2 = acc2 * alpha[:, None] + tl.dot(p16, _qc_load_v_ch(v_cache, v_scales, tok_rows, kv_head, 4, mask_n, QCV, n_kv_heads, head_dim, CH))
+        acc3 = acc3 * alpha[:, None] + tl.dot(p16, _qc_load_v_ch(v_cache, v_scales, tok_rows, kv_head, 6, mask_n, QCV, n_kv_heads, head_dim, CH))
+
+    if FINAL:
+        if HAS_SINKS:
+            sink = tl.load(sinks + q_head, mask=valid_row, other=0.0).to(tl.float32)
+            m_top = tl.maximum(m, sink)
+            alpha_s = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_top))
+            acc0 = acc0 * alpha_s[:, None]
+            acc1 = acc1 * alpha_s[:, None]
+            acc2 = acc2 * alpha_s[:, None]
+            acc3 = acc3 * alpha_s[:, None]
+            l = l * alpha_s + tl.exp(sink - m_top)
+        inv_l = 1.0 / tl.where(l == 0.0, 1.0, l)
+        out_ptr = out + (((batch * q_len + row_q) * n_q_heads + q_head) * head_dim)[:, None] + offs_c[None, :]
+        tl.store(out_ptr, _rot_h32(acc0 * inv_l[:, None], h32, BLOCK_ROWS, CH), mask=valid_row[:, None])
+        tl.store(out_ptr + CH, _rot_h32(acc1 * inv_l[:, None], h32, BLOCK_ROWS, CH), mask=valid_row[:, None])
+        tl.store(out_ptr + 2 * CH, _rot_h32(acc2 * inv_l[:, None], h32, BLOCK_ROWS, CH), mask=valid_row[:, None])
+        tl.store(out_ptr + 3 * CH, _rot_h32(acc3 * inv_l[:, None], h32, BLOCK_ROWS, CH), mask=valid_row[:, None])
+    else:
+        if split < num_splits:
+            po_ptr = partial_o + (pid * num_splits + split) * BLOCK_ROWS * HD_PAD + rows[:, None] * HD_PAD + offs_c[None, :]
+            tl.store(po_ptr, acc0)
+            tl.store(po_ptr + CH, acc1)
+            tl.store(po_ptr + 2 * CH, acc2)
+            tl.store(po_ptr + 3 * CH, acc3)
+            ml_base = (pid * num_splits + split) * BLOCK_ROWS * 2
+            tl.store(partial_ml + ml_base + rows * 2, m)
+            tl.store(partial_ml + ml_base + rows * 2 + 1, l)
+
+
 @triton.jit
 def _paged_attn_decode_combine_kernel(
     partial_o,
@@ -1028,6 +1271,7 @@ def _paged_attn_decode_combine_kernel(
     BLOCK_ROWS: tl.constexpr,
     ROWS_SUB: tl.constexpr,
     D_SUB: tl.constexpr,
+    FLAT: tl.constexpr = False,
 ):
     """Flash-decoding phase 2: reduce the per-split partial accumulators. The output row is
     written V_DIM wide per head: with an asymmetric V head dim the padded lanes are dropped
@@ -1041,17 +1285,22 @@ def _paged_attn_decode_combine_kernel(
     d_c = sub - r_c * D_CHUNKS
 
     group_size = n_q_heads // n_kv_heads
-    h_blocks = tl.cdiv(group_size, BLOCK_H)
+    h_blocks = 1 if FLAT else tl.cdiv(group_size, BLOCK_H)
     h_block = pid % h_blocks
     bh = pid // h_blocks
     batch = bh // n_kv_heads
     kv_head = bh - batch * n_kv_heads
 
     rows = r_c * ROWS_SUB + tl.arange(0, ROWS_SUB)
-    row_q = rows % BLOCK_M
-    row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
+    if FLAT:
+        row_q = rows // group_size
+        row_h_local = rows % group_size
+        valid_row = rows < q_len * group_size
+    else:
+        row_q = rows % BLOCK_M
+        row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
+        valid_row = (row_q < q_len) & (row_h_local < group_size)
     q_head = kv_head * group_size + row_h_local
-    valid_row = (row_q < q_len) & (row_h_local < group_size)
 
     offs_d = d_c * D_SUB + tl.arange(0, D_SUB)
     d_mask = offs_d < head_dim
@@ -1113,6 +1362,42 @@ def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
 
 _decode_sm_count = {}
 
+
+def decode_split_config(q_len: int, quant: bool, head_dim: int, hd_pad: int):
+    """(kernel, block_n, num_stages) for the decode split pass, shared with bc_attn.
+
+    A single query runs the full-width kernel on a 64-token tile with no software pipelining: the
+    tile loop is bound by its own dequant work, so the extra stage only cost shared memory. A
+    multi-token query over a quantized cache at head_dim 256 runs the head-dim-chunked kernel,
+    whose smaller live set leaves room for a 64-token tile at two stages; the full-width kernel
+    could not take one. Anything else keeps the original 32-token, two-stage tile."""
+    if q_len == 1:
+        return _paged_attn_decode_split_kernel, max(16, 16384 // hd_pad), 1
+    if quant and head_dim == 256 and hd_pad == 256:
+        return _paged_attn_decode_split_qc256_kernel, max(16, 16384 // hd_pad), 2
+    return _paged_attn_decode_split_kernel, max(16, 8192 // hd_pad), 2
+
+
+def decode_row_layout(q_len: int, group_size: int):
+    """Row layout of the decode split kernel: (block_m, block_h, block_rows, h_blocks, flat,
+    split_mult). Shared with bc_attn so the eager and graph paths cannot drift apart.
+
+    The per-tile cost is dequantizing the KV tile, not the dots, so the layout aims for one
+    program per kv head. A single query packs the whole GQA group into a 16-row program. A
+    multi-token query (speculative verify) packs (query, head) pairs densely, FLAT, when they
+    fit 32 rows; otherwise query positions pad to block_m and heads fill the rest, in 32-row
+    programs when that cuts the passes. Fewer, wider programs get a larger split target."""
+    block_m = triton.next_power_of_2(q_len)
+    block_h = max(16 // block_m, 1)
+    if q_len > 1:
+        flat_rows = max(16, triton.next_power_of_2(q_len * group_size))
+        if flat_rows <= 32:
+            return block_m, block_h, flat_rows, 1, True, 8
+        wide_h = max(32 // block_m, 1)
+        if triton.cdiv(group_size, wide_h) < triton.cdiv(group_size, block_h):
+            return block_m, wide_h, block_m * wide_h, triton.cdiv(group_size, wide_h), False, 8
+    return block_m, block_h, block_m * block_h, triton.cdiv(group_size, block_h), False, 2
+
 def paged_attn_triton_decode(
     q: torch.Tensor,
     k: torch.Tensor | None,
@@ -1134,7 +1419,7 @@ def paged_attn_triton_decode(
     pre_appended_len: int = 0,          # new tokens already written to the cache; count but don't append
     n_kv_heads_override: int | None = None,
     num_warps: int = 4,
-    num_stages: int = 2,
+    num_stages: int | None = None,
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
@@ -1195,13 +1480,13 @@ def paged_attn_triton_decode(
         h32 = q
 
     # K + V tiles in smem across num_stages; on small-smem devices the ladder halves the kv tile
-    candidates = halving_ladder(max(16, 8192 // hd_pad)) if block_n is None else [block_n]
+    split_kernel, cfg_block_n, cfg_stages = decode_split_config(q_len, qck > 0 and qcv > 0, head_dim, hd_pad)
+    if num_stages is None:
+        num_stages = cfg_stages
+    candidates = halving_ladder(cfg_block_n) if block_n is None else [block_n]
 
     group_size = n_q_heads // n_kv_heads
-    block_m = triton.next_power_of_2(q_len)
-    block_h = max(16 // block_m, 1)
-    block_rows = block_m * block_h
-    h_blocks = triton.cdiv(group_size, block_h)
+    block_m, block_h, block_rows, h_blocks, flat, split_mult = decode_row_layout(q_len, group_size)
     num_pages_per_seq = block_table.shape[1]
 
     # Upper bound on kv length: caller-provided hint, else from the block table shape
@@ -1215,7 +1500,7 @@ def paged_attn_triton_decode(
     dev = q.device.index
     if dev not in _decode_sm_count:
         _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
-    target = 2 * _decode_sm_count[dev]
+    target = split_mult * _decode_sm_count[dev]
 
     def prepare(block_n):
         """Split count, partial buffers and the split kernel's argument list for one kv tile."""
@@ -1236,16 +1521,16 @@ def paged_attn_triton_decode(
             qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            splits == 1, has_sinks, block_m, block_h, block_rows, block_n,
+            splits == 1, has_sinks, block_m, block_h, block_rows, block_n, flat,
         )
         return args, splits, partial_o, partial_ml
 
     with torch.cuda.device(q.device):
-        pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_h, bool(causal), window_left >= 0,
+        pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_h, flat, bool(causal), window_left >= 0,
                     window_right >= 0, has_sinks, num_warps, num_stages, candidates[0])
         block_n = pick_config(
             q.device, "paged_attn_decode", pick_key, candidates,
-            lambda bn: shared_bytes(_paged_attn_decode_split_kernel, prepare(bn)[0],
+            lambda bn: shared_bytes(split_kernel, prepare(bn)[0],
                                     num_warps = num_warps, num_stages = num_stages))
         args, num_splits, partial_o, partial_ml = prepare(block_n)
 
@@ -1257,7 +1542,7 @@ def paged_attn_triton_decode(
                 num_warps=2, num_stages=3,
             )
 
-        _paged_attn_decode_split_kernel[(programs, num_splits)](
+        split_kernel[(programs, num_splits)](
             *args, num_warps = num_warps, num_stages = num_stages,
         )
 
@@ -1266,7 +1551,7 @@ def paged_attn_triton_decode(
             _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                 partial_o, partial_ml, out, h32,
                 num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
-                block_m, block_h, block_rows, rows_sub, d_sub,
+                block_m, block_h, block_rows, rows_sub, d_sub, flat,
                 num_warps=4, num_stages=1,
             )
     return out
