@@ -31,6 +31,9 @@ def _alloc_worker(ref: weakref.ref, cond: threading.Condition, stop: threading.E
                         return
                     full = len(tier.slot_slabs) + len(tier._spare) >= tier.max_slots
                     del tier
+                    # Dropping the last reference here runs the finalizer on this thread, whose notify has no waiter
+                    if stop.is_set():
+                        return
                     if not full:
                         break
                     cond.wait()

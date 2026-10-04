@@ -5,6 +5,7 @@ import signal
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
@@ -427,6 +428,40 @@ def mp_rotate_cache_pages(
 # vm.max_map_count (~65k mappings by default) long before it runs out of memory, silently degrading the whole
 # pool to pageable buffers.
 
+def _rank_pool_stop(cond: threading.Condition, stop: threading.Event):
+    stop.set()
+    with cond:
+        cond.notify_all()
+
+
+def _rank_pool_worker(ref: weakref.ref, cond: threading.Condition, stop: threading.Event):
+    # Same contract as cpu_cache._alloc_worker: the pool is held only through a weak reference and only while
+    # touching it, so a pool that is replaced or dropped releases its pinned slabs instead of being kept alive
+    # by its own thread
+    with torch.inference_mode():
+        while not stop.is_set():
+            with cond:
+                while True:
+                    pool = ref()
+                    if pool is None or stop.is_set():
+                        return
+                    full = len(pool.slots) + len(pool._spare) >= pool.max_slots
+                    del pool
+                    # Dropping the last reference here runs the finalizer on this thread, whose notify has no waiter
+                    if stop.is_set():
+                        return
+                    if not full:
+                        break
+                    cond.wait()
+            pool = ref()
+            if pool is None:
+                return
+            buffers = pool._make_buffers()  # slow part, outside the lock
+            with cond:
+                pool._spare.append(buffers)
+            del pool
+
+
 class RankSlotPool:
     """
     This rank's half (or third, or...) of the CPU page cache: one pinned slab per slot index.
@@ -453,8 +488,14 @@ class RankSlotPool:
 
         self._spare = deque()
         self._spare_cond = threading.Condition()
-        self._alloc_thread = threading.Thread(target = self._alloc_worker, daemon = True)
+        self._stop_event = threading.Event()
+        self._alloc_thread = threading.Thread(
+            target = _rank_pool_worker,
+            args = (weakref.ref(self), self._spare_cond, self._stop_event),
+            daemon = True,
+        )
         self._alloc_thread.start()
+        weakref.finalize(self, _rank_pool_stop, self._spare_cond, self._stop_event)
 
 
     def _make_buffers(self):
@@ -473,15 +514,16 @@ class RankSlotPool:
                 for offset, shape, dtype, nbytes in self.segments]
 
 
-    def _alloc_worker(self):
-        with torch.inference_mode():
-            while True:
-                with self._spare_cond:
-                    while len(self.slots) + len(self._spare) >= self.max_slots:
-                        self._spare_cond.wait()
-                buffers = self._make_buffers()  # slow part, outside the lock
-                with self._spare_cond:
-                    self._spare.append(buffers)
+    def close(self):
+        """
+        Stop the pinning thread and drop every slab. Optional: the same happens when the pool is garbage
+        collected, this just makes it deterministic.
+        """
+        _rank_pool_stop(self._spare_cond, self._stop_event)
+        self._alloc_thread.join()
+        with self._spare_cond:
+            self._spare.clear()
+        self.slots = {}
 
 
     def get(self, slot: int):
@@ -517,8 +559,17 @@ def mp_cpu_cache_init(local_context: dict, cache_ids: list[int], max_slots: int)
     """
     cache_tensors = mp_cpu_cache_tensors(local_context, cache_ids)
     if max_slots:
+        # One pool per rank: a new Generator's tier replaces the previous Generator's
+        mp_cpu_cache_close(local_context)
         local_context["cpu_page_cache"] = RankSlotPool(cache_tensors, max_slots)
     return sum(t[0].numel() * t.element_size() for t in cache_tensors)
+
+
+def mp_cpu_cache_close(local_context: dict):
+    pool = local_context.get("cpu_page_cache")
+    if pool is not None:
+        pool.close()
+        local_context["cpu_page_cache"] = None
 
 
 def mp_cpu_cache_store(local_context: dict, cache_ids: list[int], slot: int, page_index: int):

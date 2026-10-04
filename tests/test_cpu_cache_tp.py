@@ -1,4 +1,7 @@
+import gc
 import pytest
+import time
+import weakref
 import torch
 from collections import namedtuple
 from types import SimpleNamespace
@@ -8,6 +11,7 @@ from exllamav3.model.model_tp_fn import (
     mp_cpu_cache_init,
     mp_cpu_cache_store,
     mp_cpu_cache_fetch,
+    mp_cpu_cache_close,
 )
 
 # In TP mode the main process holds no cache tensors, so the whole path can be driven on the host: the ranks
@@ -217,6 +221,53 @@ def test_ranks_pin_their_buffers(tp_cache):
         assert buffers, "rank allocated no buffers for the slot"
         if not rank["cpu_page_cache"].pageable:
             assert all(b.is_pinned() for b in buffers)
+
+
+def test_a_new_tier_releases_the_previous_rank_pools(tp_cache):
+    # A Generator built on the same model (TabbyAPI recreates one after a latch) replaces each rank's pool.
+    # The old pools must go with their pinned slabs, not stay alive through their own pinning threads
+    ranks, cache_ids, model, caches = tp_cache
+    build(model, caches, 64 * 4096)
+    old_pools = [weakref.ref(rank["cpu_page_cache"]) for rank in ranks]
+
+    build(model, caches, 64 * 4096)
+    gc.collect()
+
+    assert all(ref() is None for ref in old_pools)
+    assert all(rank["cpu_page_cache"] is not None for rank in ranks)
+
+
+def test_a_dropped_rank_pool_is_collected(tp_cache):
+    # The pinning thread must not keep a pool alive once nothing else refers to it
+    ranks, cache_ids, model, caches = tp_cache
+    build(model, caches, 64 * 4096)
+    pools = [weakref.ref(rank["cpu_page_cache"]) for rank in ranks]
+    threads = [rank["cpu_page_cache"]._alloc_thread for rank in ranks]
+
+    for rank in ranks:
+        rank["cpu_page_cache"] = None
+    # The thread holds the pool while it pins a slab, so release can trail by one slab
+    deadline = time.time() + 5
+    while any(ref() is not None for ref in pools) and time.time() < deadline:
+        gc.collect()
+        time.sleep(0.01)
+
+    assert all(ref() is None for ref in pools)
+    for thread in threads:
+        thread.join(5.0)
+        assert not thread.is_alive()
+
+
+def test_closing_a_rank_pool_stops_its_thread(tp_cache):
+    ranks, cache_ids, model, caches = tp_cache
+    build(model, caches, 64 * 4096)
+    pool = ranks[0]["cpu_page_cache"]
+
+    mp_cpu_cache_close(ranks[0])
+
+    assert ranks[0]["cpu_page_cache"] is None
+    assert not pool._alloc_thread.is_alive()
+    assert not pool.slots and not pool._spare
 
 
 def test_a_draft_cache_on_its_own_model_is_dispatched_separately():
