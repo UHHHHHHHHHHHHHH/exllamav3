@@ -56,6 +56,7 @@ class Generator:
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
         hybrid_draft_tokens: int = 0,
+        mtp_hot_head: int | None = None,
         **kwargs
     ):
         """
@@ -130,6 +131,12 @@ class Generator:
 
         :param record_draft_stats:
             Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
+
+        :param mtp_hot_head:
+            MTP drafting only: number of rows in a draft-only LM head that learns which tokens the model
+            generates (MTPHotHead), so draft steps skip the full vocabulary head. Verification keeps the full
+            head, so only the acceptance rate can change. Costs a pinned host copy of the head in fp16 and the
+            table itself on the drafter's device. None falls back to EXL3_MTP_HOT_HEAD, 0 disables.
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -371,19 +378,10 @@ class Generator:
 
         self.mtp_hot_head = None
         self._hot_drafted = False
-        hot_rows = int(os.environ.get("EXL3_MTP_HOT_HEAD", "0"))
-        if self.mtp_draft and hot_rows > 0:
-            self.mtp_hot_head = MTPHotHead(
-                model,
-                self.draft_model.output_device,
-                hot_rows,
-                stats_path = os.path.join(
-                    os.environ["EXL3_MTP_HOT_HEAD_STATS"],
-                    os.path.basename(os.path.normpath(model.config.directory)) + ".npz"
-                ) if os.environ.get("EXL3_MTP_HOT_HEAD_STATS") else None,
-                min_tokens = int(os.environ.get("EXL3_MTP_HOT_HEAD_MIN_TOKENS", "20000")),
-                rebuild_every = int(os.environ.get("EXL3_MTP_HOT_HEAD_REBUILD", "8192")),
-            )
+        if mtp_hot_head is None:
+            mtp_hot_head = int(os.environ.get("EXL3_MTP_HOT_HEAD", 0))
+        if self.mtp_draft and mtp_hot_head > 0:
+            self.mtp_hot_head = MTPHotHead.from_model(model, self.draft_model.output_device, mtp_hot_head)
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -753,7 +751,7 @@ class Generator:
 
         Releases, in order of size: the recurrent checkpoint cache (up to recurrent_cache_size of system
         RAM, in the tensor-parallel ranks too), the CPU page cache tier (cpu_cache_size of pinned memory),
-        the pinned staging and draft buffers, and the filter thread pool.
+        the pinned staging and draft buffers (with the MTP hot head's row store), and the filter thread pool.
         """
         if self.disk_page_cache is not None:
             # Persist what is still only in VRAM or RAM, then let the writer drain before its sources go away.
@@ -770,6 +768,9 @@ class Generator:
             self.cpu_page_cache.close()
             self.cpu_page_cache = None
             self.pagetable.cpu_tier = None
+        if self.mtp_hot_head is not None:
+            self.mtp_hot_head.close()
+            self.mtp_hot_head = None
         self.sample_pinned = None
         self.staging_buffers = {}
         self.draft_input_ids_pinned = None
@@ -924,6 +925,8 @@ class Generator:
         # numerics) and must never land mid-stream
         from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
         run_pending_swap_sweeps(self.model.config.infer_params)
+        if self.mtp_hot_head is not None:
+            self.mtp_hot_head.on_idle()
         malloc_trim()
 
 
