@@ -19,6 +19,8 @@ from ..util import log_tp
 GLOBALS_SIZE = 128*1024
 SHBUF_SIZE = 16 * 1024 ** 2
 _nccl_fp32 = os.environ.get("EXL3_TP_NCCL_FP32", "0") != "0"
+_tp_p2p = os.environ.get("EXL3_TP_P2P", "0") != "0"
+P2P_SLOT_BYTES = 2 * 1024 ** 2
 # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
 SHBUF_SIZE_R = 17 * 8 * 256 * 1024
 SHBUF_SIZE_S = 16 * 1024
@@ -71,6 +73,41 @@ class TPBackendNull:
         pass
 
 
+class P2PAllReduce:
+    """
+    Two-rank one-shot all-reduce for the NCCL backend: each rank writes its partial sums straight into
+    the peer's receive buffer over P2P and adds the peer's locally, in one kernel launch. fp32 tensors
+    travel as bf16 and are summed in bf16, as NCCL does for them, so the result is bit-identical to the
+    NCCL path. Payloads larger than a receive slot stay on NCCL.
+    """
+
+    def __init__(self, device: int, rank: int, active_devices: list[int]):
+        self.device = device
+        self.base, handle = ext.p2p_alloc(ext.P2P_FLAGS_BYTES + 2 * P2P_SLOT_BYTES, device)
+        handles = [None, None]
+        dist.all_gather_object(handles, handle)
+        self.peer = ext.p2p_open(handles[1 - rank], device)
+        self.epochs = torch.zeros(ext.P2P_BLOCKS, dtype = torch.int32, device = device)
+        dist.barrier()
+
+    def all_reduce(self, tensor: torch.Tensor) -> bool:
+        if tensor.dtype not in (torch.float32, torch.half, torch.bfloat16) or not tensor.is_contiguous():
+            return False
+        if tensor.dtype == torch.float32 and _nccl_fp32:
+            return False
+        if tensor.numel() * 2 > P2P_SLOT_BYTES:
+            return False
+        ext.p2p_all_reduce(tensor, self.base, self.peer, P2P_SLOT_BYTES, self.epochs)
+        return True
+
+    def close_peer(self):
+        torch.cuda.synchronize(self.device)
+        ext.p2p_close(self.peer, self.device)
+
+    def free(self):
+        ext.p2p_free(self.base, self.device)
+
+
 class TPBackendNCCL:
 
     def __init__(
@@ -109,6 +146,14 @@ class TPBackendNCCL:
             init_method = init_method,
         )
         self.mp_warmup_nccl(device)
+        self.p2p = None
+        if _tp_p2p and self.world_size == 2:
+            peer = active_devices[1 - self.rank]
+            if torch.cuda.can_device_access_peer(device, peer):
+                self.p2p = P2PAllReduce(device, self.rank, active_devices)
+                print(f" -- P2P all-reduce enabled, device {device} <-> {peer}")
+            else:
+                print(f" !! EXL3_TP_P2P: device {device} cannot access device {peer}, staying on NCCL")
         self.fallback = TPBackendNative(
             device,
             active_devices,
@@ -138,6 +183,12 @@ class TPBackendNCCL:
             return
 
         dist.barrier()
+        if self.p2p is not None:
+            # Unmap the peer's buffer on both ranks before either frees its own
+            self.p2p.close_peer()
+            dist.barrier()
+            self.p2p.free()
+            self.p2p = None
         self.fallback.close()
         dist.destroy_process_group()
 
@@ -153,6 +204,8 @@ class TPBackendNCCL:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        if self.p2p is not None and self.p2p.all_reduce(tensor):
+            return
         # fp32 payloads normally go over a bf16 wire like the native backend; EXL3_TP_NCCL_FP32=1
         # reduces them in fp32 (A/B testing of the wire rounding)
         if tensor.dtype == torch.float32 and not _nccl_fp32:
