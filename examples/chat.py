@@ -93,6 +93,7 @@ def main(args):
         ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
         draft_confidence = args.draft_confidence,
+        mtp_hot_head = args.mtp_hot_head,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
         disk_cache_dir = args.disk_cache_dir,
         disk_cache_size = int(args.disk_cache_size * 1024 ** 3),

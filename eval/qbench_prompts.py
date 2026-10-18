@@ -380,6 +380,7 @@ def main(args):
         ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
         draft_confidence = args.draft_confidence,
+        mtp_hot_head = args.mtp_hot_head,
         max_chunk_size = args.chunk_size,
     )
 

@@ -226,6 +226,7 @@ def main(args):
             hybrid_draft_tokens = args.hybrid_draft_tokens,
             dynamic_draft_tokens = args.dynamic_draft,
             draft_confidence = args.draft_confidence,
+            mtp_hot_head = args.mtp_hot_head,
             record_draft_stats = stats_sink is not None,
             max_chunk_size = args.chunk_size,
         )
@@ -246,6 +247,7 @@ def main(args):
             num_draft_tokens = args.num_draft_tokens,
             hybrid_draft_tokens = args.hybrid_draft_tokens,
             draft_confidence = args.draft_confidence,
+            mtp_hot_head = args.mtp_hot_head,
             dynamic_draft_tokens = args.dynamic_draft,
             record_draft_stats = stats_sink is not None,
             max_chunk_size = args.chunk_size,
