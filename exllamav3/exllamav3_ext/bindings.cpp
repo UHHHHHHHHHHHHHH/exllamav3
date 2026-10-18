@@ -6,6 +6,9 @@
 
 #include "stloader.h"
 #include "cuda_host.h"
+#if !defined(USE_ROCM)
+#include "p2p_all_reduce.cuh"
+#endif
 #include "hadamard.h"
 
 #include "norm.cuh"
@@ -221,6 +224,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
     m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
 #if !defined(USE_ROCM)
+    m.def("p2p_alloc", &p2p_alloc, py::arg("nbytes"), py::arg("device"));
+    m.def("p2p_open", &p2p_open, py::arg("handle"), py::arg("device"));
+    m.def("p2p_free", &p2p_free, py::arg("ptr"), py::arg("device"));
+    m.def("p2p_close", &p2p_close, py::arg("ptr"), py::arg("device"));
+    m.def("p2p_all_reduce", &p2p_all_reduce, py::arg("data"), py::arg("local_base"), py::arg("peer_base"), py::arg("slot_bytes"), py::arg("epochs"));
+    m.attr("P2P_FLAGS_BYTES") = P2P_FLAGS_BYTES;
+    m.attr("P2P_BLOCKS") = P2P_BLOCKS;
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
