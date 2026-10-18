@@ -408,7 +408,10 @@ class Generator:
                 model,
                 self.draft_model.output_device,
                 hot_rows,
-                stats_path = os.environ.get("EXL3_MTP_HOT_HEAD_STATS") or None,
+                stats_path = os.path.join(
+                    os.environ["EXL3_MTP_HOT_HEAD_STATS"],
+                    os.path.basename(os.path.normpath(model.config.directory)) + ".npz"
+                ) if os.environ.get("EXL3_MTP_HOT_HEAD_STATS") else None,
                 min_tokens = int(os.environ.get("EXL3_MTP_HOT_HEAD_MIN_TOKENS", "20000")),
                 rebuild_every = int(os.environ.get("EXL3_MTP_HOT_HEAD_REBUILD", "8192")),
             )
