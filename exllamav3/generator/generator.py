@@ -1127,14 +1127,14 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
-        hot = self.mtp_hot_head if self.mtp_hot_head is not None and self.mtp_hot_head.ready else None
-        self._hot_drafted = hot is not None
-        if hot is not None:
+        if self.mtp_hot_head is not None:
             for job in self.active_jobs:
                 if job.is_prefill_done() and not job.hot_seeded:
-                    hot.add_sequence(job.sequences[0].sequence_ids.torch())
+                    self.mtp_hot_head.add_sequence(job.sequences[0].sequence_ids.torch())
                     job.hot_seeded = True
-            hot.apply_inserts()
+            self.mtp_hot_head.apply_inserts()
+        hot = self.mtp_hot_head if self.mtp_hot_head is not None and self.mtp_hot_head.active else None
+        self._hot_drafted = hot is not None
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
