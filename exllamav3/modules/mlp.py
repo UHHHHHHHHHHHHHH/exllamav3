@@ -557,6 +557,8 @@ class MLP(Module):
 
 class GatedMLP(Module):
 
+    tp_collect_is_final = True
+
     def __init__(
         self,
         config: Config | None,

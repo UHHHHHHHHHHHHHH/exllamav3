@@ -149,6 +149,8 @@ def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
 
 class Attention(Module):
 
+    tp_collect_is_final = True
+
     def __init__(
         self,
         config: Config | None,
