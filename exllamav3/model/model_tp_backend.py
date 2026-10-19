@@ -90,15 +90,38 @@ class P2PAllReduce:
         self.epochs = torch.zeros(ext.P2P_BLOCKS, dtype = torch.int32, device = device)
         dist.barrier()
 
-    def all_reduce(self, tensor: torch.Tensor) -> bool:
+    def accepts(self, tensor: torch.Tensor) -> bool:
         if tensor.dtype not in (torch.float32, torch.half, torch.bfloat16) or not tensor.is_contiguous():
             return False
         if tensor.dtype == torch.float32 and _nccl_fp32:
             return False
-        if tensor.numel() * 2 > P2P_SLOT_BYTES:
+        return tensor.numel() * 2 <= P2P_SLOT_BYTES
+
+    def all_reduce(self, tensor: torch.Tensor) -> bool:
+        if not self.accepts(tensor):
             return False
         ext.p2p_all_reduce(tensor, self.base, self.peer, P2P_SLOT_BYTES, self.epochs)
         return True
+
+    def reduce_residual(self, partial: torch.Tensor, residual: torch.Tensor, norm = None) -> torch.Tensor | None:
+        dim = partial.shape[-1]
+        y = None
+        if norm is not None:
+            y = torch.empty_like(partial, dtype = torch.half)
+        ext.p2p_reduce_residual(
+            partial.view(-1, dim),
+            residual.view(-1, dim),
+            None if norm is None else norm.weight,
+            None if y is None else y.view(-1, dim),
+            0.0 if norm is None else norm.rms_norm_eps,
+            0.0 if norm is None else norm.constant_bias,
+            1.0 if norm is None else norm.constant_scale,
+            self.base,
+            self.peer,
+            P2P_SLOT_BYTES,
+            self.epochs,
+        )
+        return y
 
     def close_peer(self):
         torch.cuda.synchronize(self.device)
@@ -147,6 +170,8 @@ class TPBackendNCCL:
         )
         self.mp_warmup_nccl(device)
         self.p2p = None
+        self._defer = False
+        self._deferred = None
         if _tp_p2p and self.world_size == 2:
             peer = active_devices[1 - self.rank]
             if torch.cuda.can_device_access_peer(device, peer):
@@ -203,7 +228,48 @@ class TPBackendNCCL:
         # dist.broadcast(tensor, src = src_rank)
 
 
+    def defer_reduce(self):
+        """
+        Hold the next all-reduce the P2P path can serve, so the caller can fuse it with the residual add
+        (and the norm after it) through reduce_residual(). take_deferred() must follow.
+        """
+        self._defer = self.p2p is not None
+        self._deferred = None
+
+    def take_deferred(self, tensor: torch.Tensor) -> bool:
+        """True when tensor is the held, still unreduced result; any other held reduce runs now instead."""
+        held, self._deferred, self._defer = self._deferred, None, False
+        if held is tensor:
+            return True
+        if held is not None:
+            self.p2p.all_reduce(held)
+        return False
+
+    def reduce_residual(self, partial: torch.Tensor, residual: torch.Tensor, norm = None) -> torch.Tensor | None:
+        """
+        All-reduce partial and add it to residual in place; with norm, also return norm(residual) in fp16.
+        Bit-identical to all_reduce(), residual += partial and norm.forward(..., residual_in = residual).
+        """
+        fused_types = (torch.float32, torch.half)
+        if partial.dtype in fused_types and residual.dtype in fused_types and residual.is_contiguous():
+            return self.p2p.reduce_residual(partial, residual, norm)
+        self.p2p.all_reduce(partial)
+        if norm is None:
+            residual += partial
+            return None
+        return norm.forward(partial, {}, out_dtype = torch.half, residual_in = residual)
+
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        if self._deferred is not None:
+            # A second reduce while one is held: run the held one first, keep call order on both ranks
+            self.p2p.all_reduce(self._deferred)
+            self._deferred = None
+            self._defer = False
+        elif self._defer:
+            self._defer = False
+            if self.p2p.accepts(tensor):
+                self._deferred = tensor
+                return
         if self.p2p is not None and self.p2p.all_reduce(tensor):
             return
         # fp32 payloads normally go over a bf16 wire like the native backend; EXL3_TP_NCCL_FP32=1

@@ -13,6 +13,10 @@ from functools import cached_property
 
 class Module(ABC):
 
+    # True when forward()'s only TP collective is the all-reduce of the tensor it returns, as its last step,
+    # so the caller may defer that reduce and fuse it with the residual add (TPBackendNCCL.defer_reduce)
+    tp_collect_is_final = False
+
     def __init__(
         self,
         config: Config | None,

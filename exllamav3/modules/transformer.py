@@ -140,6 +140,14 @@ class TransformerBlock(Module):
             hc_flush(params)
         return super().prepare_for_device(x, params)
 
+    def tp_fusable(self) -> bool:
+        return (
+            self.attn is not None and self.attn.tp_collect_is_final and not self.attn_hc and
+            not self.attn_post_norm and self.attn_resid_scalar is None and
+            self.mlp is not None and self.mlp.tp_collect_is_final and not self.mlp_hc and
+            not self.mlp_post_norm and self.mlp_resid_scalar is None and self.mlp_norm is not None
+        )
+
     @override
     def forward(
         self,
@@ -153,6 +161,15 @@ class TransformerBlock(Module):
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
 
+        # Two-rank P2P TP: hold each module's final all-reduce and fuse it with the residual add, and after
+        # attention with the MLP input norm too (bit-identical to the unfused sequence)
+        backend = params.get("backend")
+        fuse = (
+            getattr(backend, "p2p", None) is not None and self.tp_fusable() and x.is_contiguous() and
+            self.mlp_norm.key not in params.get("export_state_norm_keys", ())
+        )
+        attn_held = False
+
         if self.attn:
             if self.attn_hc:
                 hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
@@ -163,7 +180,10 @@ class TransformerBlock(Module):
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
+            if fuse:
+                backend.defer_reduce()
             y = self.attn.forward(y, params)
+            attn_held = fuse and backend.take_deferred(y)
             if params.get("prefill") and not export_state:
                 return x
             if self.attn_resid_scalar is not None:
@@ -174,6 +194,8 @@ class TransformerBlock(Module):
                 self.attn_post_norm.forward(y, params, residual = x)
             elif self.mlp is not None and self.mlp_norm is not None and self.mlp_norm.can_fuse_residual(x, y):
                 y_resid = y
+            elif attn_held:
+                backend.reduce_residual(y, x)
             else:
                 x += y
 
@@ -185,19 +207,26 @@ class TransformerBlock(Module):
                     y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
             else:
                 params["residual"] = x
-                if y_resid is not None:
+                if y_resid is not None and attn_held:
+                    y = backend.reduce_residual(y_resid, x, self.mlp_norm)
+                elif y_resid is not None:
                     y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
                 elif self.mlp_norm:
                     y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
                 else:
                     y = x.half()
+            if fuse:
+                backend.defer_reduce()
             y = self.mlp.forward(y, params)
+            mlp_held = fuse and backend.take_deferred(y)
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
             if self.mlp_hc:
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
+            elif mlp_held:
+                backend.reduce_residual(y, x)
             else:
                 x += y
 
