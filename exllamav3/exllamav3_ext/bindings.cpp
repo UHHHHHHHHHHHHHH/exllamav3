@@ -228,6 +228,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("p2p_free", &p2p_free, py::arg("ptr"), py::arg("device"));
     m.def("p2p_close", &p2p_close, py::arg("ptr"), py::arg("device"));
     m.def("p2p_all_reduce", &p2p_all_reduce, py::arg("data"), py::arg("local_base"), py::arg("peer_base"), py::arg("slot_bytes"), py::arg("epochs"));
+    m.def("p2p_reduce_residual", &p2p_reduce_residual, py::arg("data"), py::arg("residual"), py::arg("weight"), py::arg("y"),
+          py::arg("epsilon"), py::arg("constant_bias"), py::arg("constant_scale"),
+          py::arg("local_base"), py::arg("peer_base"), py::arg("slot_bytes"), py::arg("epochs"));
     m.attr("P2P_FLAGS_BYTES") = P2P_FLAGS_BYTES;
     m.attr("P2P_BLOCKS") = P2P_BLOCKS;
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");

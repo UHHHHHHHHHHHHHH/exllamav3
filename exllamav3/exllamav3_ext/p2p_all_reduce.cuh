@@ -11,3 +11,6 @@ int64_t p2p_open(py::bytes handle, int64_t device);
 void p2p_free(int64_t ptr, int64_t device);
 void p2p_close(int64_t ptr, int64_t device);
 void p2p_all_reduce(at::Tensor data, int64_t local_base, int64_t peer_base, int64_t slot_bytes, at::Tensor epochs);
+void p2p_reduce_residual(at::Tensor data, at::Tensor residual, c10::optional<at::Tensor> weight, c10::optional<at::Tensor> y,
+                         float epsilon, float constant_bias, float constant_scale,
+                         int64_t local_base, int64_t peer_base, int64_t slot_bytes, at::Tensor epochs);
